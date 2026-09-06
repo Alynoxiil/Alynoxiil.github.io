@@ -1,16 +1,6 @@
 #!/usr/bin/env bash
-# ============================================================================
-#  Opiumware self-test  —  is Opiumware working as intended?
-#
-#  ASSUMES: macOS (Apple Silicon), Roblox is OPEN and you are IN A GAME,
-#           and the Opiumware app is open + logged in.
-#
-#  Runs five checks and prints a status list:
-#     [ ] = not tested   [✔] = functional   [✘] = failed
-#
-#  It is read-only except for one tiny self-test file it writes into your own
-#  Opiumware workspace and then deletes. It does not phone home.
-# ============================================================================
+# Opiumware diagnosis tool, made by Alynoxiil and Claude - with love
+# I do not know how to code bash :3
 
 # re-exec under bash if launched with sh/zsh (we need /dev/tcp)
 if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
