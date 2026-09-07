@@ -13,7 +13,7 @@
 #  Usage:
 #    bash opiumware-install-intel-advanced.sh [--dry-run] [--force]
 #                                             [--no-launch] [--keep-temp]
-#  Made by alynoxiil and claude - with love
+#  Made by Alynoxiil and Claude - with love
 # ============================================================================
 set -euo pipefail
 
@@ -43,30 +43,61 @@ DYLIB_URL="${DYLIB_URL:-https://anc4cpypjs.ufs.sh/f/fuloy9zwEAJtAjK4o1OYAO54X3Sk
 MODULES_URL="${MODULES_URL:-https://anc4cpypjs.ufs.sh/f/fuloy9zwEAJttWYtKgNokjGhinW70dSALrVy1Ugmuf3b628T}"
 UI_URL="${UI_URL:-https://anc4cpypjs.ufs.sh/f/fuloy9zwEAJtvE7eVgbncYl7dhxBGyMKF3U4o50piQgtJDnX}"
 
-# ----- logging --------------------------------------------------------------
-LOG_DIR="$HOME/Opiumware/logs"
+# ----- resolve the REAL user + home -----------------------------------------
+# Opiumware's workspace/modules MUST live in the invoking user's home, even when
+# this is run under sudo (where $HOME would otherwise become root's /var/root).
+# Pick the user whose home Opiumware should live in — robust across every way
+# people run this under sudo:
+#   * `sudo bash script`     -> SUDO_USER is set          (most common)
+#   * `sudo -i` / `sudo su`  -> SUDO_USER empty, we fall back to the console
+#                               (GUI login) user so it still lands in their home
+#   * normal (no sudo)       -> the current user
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    RUN_USER="$SUDO_USER"
+elif [ "$(id -u)" = 0 ]; then
+    _con="$(stat -f%Su /dev/console 2>/dev/null || true)"
+    if [ -n "$_con" ] && [ "$_con" != "root" ]; then RUN_USER="$_con"; else RUN_USER="root"; fi
+else
+    RUN_USER="$(id -un)"
+fi
+if [ "$RUN_USER" != "root" ]; then
+    USER_HOME="$(dscl . -read "/Users/$RUN_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+    [ -z "$USER_HOME" ] && USER_HOME="/Users/$RUN_USER"
+else
+    USER_HOME="$HOME"
+fi
+OPIUM_HOME="$USER_HOME/Opiumware"
+
+# ----- logging (sudo-safe: explicit dual-write, NO process substitution) -----
+# NB: `exec > >(tee ...)` raises "Bad file descriptor" under sudo / some shells,
+# so instead we write every line to BOTH the console and the log file explicitly.
+LOG_DIR="$OPIUM_HOME/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/install-$(date +%Y%m%d-%H%M%S).log"
-# full transcript: everything below (echo + every command's stdout/stderr) is tee'd
-exec > >(tee -a "$LOG_FILE") 2>&1
 
-ts()   { date '+%Y-%m-%d %H:%M:%S'; }
-line() { printf '%s [%-5s] %s\n' "$(ts)" "$1" "$2"; }
-info() { line INFO  "$*"; }
-step() { line STEP  "$*"; }
-ok()   { line OK    "$*"; }
-warn() { line WARN  "$*"; }
-err()  { line ERROR "$*"; }
+ts()    { date '+%Y-%m-%d %H:%M:%S'; }
+_emit() { printf '%s\n' "$1"; printf '%s\n' "$1" >>"$LOG_FILE" 2>/dev/null || true; }
+line()  { _emit "$(printf '%s [%-5s] %s' "$(ts)" "$1" "$2")"; }
+info()  { line INFO  "$*"; }
+step()  { line STEP  "$*"; }
+ok()    { line OK    "$*"; }
+warn()  { line WARN  "$*"; }
+err()   { line ERROR "$*"; }
 
 START_EPOCH=$(date +%s)
 
-# run a single step: log it, run it (output flows to the transcript), tag OK/ERROR
+# run a single step: log it, run it, capture its output to console+log, tag OK/ERROR
 run() {
     local desc="$1"; shift
     step "$desc"
-    line CMD   "$*"
-    if "$@"; then ok "$desc"; return 0
-    else local rc=$?; err "$desc  (exit $rc)"; return $rc; fi
+    line CMD "$*"
+    local out rc _l
+    if out="$("$@" 2>&1)"; then rc=0; else rc=$?; fi
+    if [ -n "$out" ]; then
+        while IFS= read -r _l || [ -n "$_l" ]; do _emit "        | $_l"; done <<< "$out"
+    fi
+    if [ "$rc" -eq 0 ]; then ok "$desc"; return 0
+    else err "$desc  (exit $rc)"; return "$rc"; fi
 }
 
 # ----- traps ----------------------------------------------------------------
@@ -93,6 +124,15 @@ info "  arch        : $(uname -m)"
 info "  cpu         : $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo '?')"
 info "  curl        : $(curl --version 2>/dev/null | head -1)"
 info "  free space  : $(df -h /Applications 2>/dev/null | awk 'NR==2{print $4" on "$9}')"
+info "  running as  : $(id -un) (uid $(id -u))"
+info "  opium home  : $OPIUM_HOME"
+if [ "$(id -u)" = 0 ]; then
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+        info "  sudo detected — Opiumware paths point at ${SUDO_USER}'s home; ownership is restored at the end"
+    else
+        warn "  running as root with no SUDO_USER — Opiumware home resolves to root's home. Prefer running as your normal user (sudo is only needed to remove a stubborn old app)."
+    fi
+fi
 
 # ----- arch guard -----------------------------------------------------------
 ARCH="$(uname -m)"
@@ -131,11 +171,12 @@ download() { # url out label
     local url="$1" out="$2" label="$3"
     step "download: $label"
     line CMD "curl -fSL $url -> $out"
-    local stats
-    stats=$(curl -fSL --retry 3 --retry-delay 2 -o "$out" \
+    local stats rc
+    if stats="$(curl -fSL --retry 3 --retry-delay 2 -o "$out" \
         -w 'http=%{http_code} bytes=%{size_download} time=%{time_total}s speed=%{speed_download}B/s' \
-        "$url") || { err "download failed: $label"; return 1; }
+        "$url" 2>&1)"; then rc=0; else rc=$?; fi
     info "  curl: $stats"
+    if [ "$rc" -ne 0 ]; then err "download failed: $label (curl exit $rc)"; return 1; fi
     info "  size: $(stat -f%z "$out" 2>/dev/null || echo '?') bytes"
     info "  sha256: $(shasum -a 256 "$out" | cut -d' ' -f1)"
     ok "download: $label"
@@ -221,7 +262,7 @@ remove_app "$OPIUM_APP"
 step "clear stale module binaries (targeted, non-fatal — no recursive wipe)"
 mkdir -p "$BACKUP_DIR" 2>/dev/null || true
 for m in "modules/decompiler/Decompiler" "modules/LuauLSP/LuauLSP"; do
-    src="$HOME/Opiumware/$m"
+    src="$OPIUM_HOME/$m"
     if [ -e "$src" ]; then
         mkdir -p "$BACKUP_DIR/$(dirname "$m")" 2>/dev/null || true
         cp -f "$src" "$BACKUP_DIR/$m" 2>/dev/null && info "  backed up  $m -> $BACKUP_DIR/$m" || warn "  could not back up $m"
@@ -230,8 +271,8 @@ for m in "modules/decompiler/Decompiler" "modules/LuauLSP/LuauLSP"; do
         info "  not present: $m"
     fi
 done
-rm -f "$HOME/Opiumware/modules/update.json" 2>/dev/null || true
-info "  left ~/Opiumware/modules/ directory tree intact (no rm -rf)"
+rm -f "$OPIUM_HOME/modules/update.json" 2>/dev/null || true
+info "  left $OPIUM_HOME/modules/ directory tree intact (no rm -rf)"
 
 # ----------------------------------------------------------------------------
 # PHASE 5 — install (each step logged individually)
@@ -256,9 +297,15 @@ run "remove RobloxMenuBar.app"         rm -rf "$ROBLOX_APP/Contents/MacOS/Roblox
 run "codesign Roblox.app (adhoc,deep)" codesign --force --deep --sign - "$ROBLOX_APP"
 run "place Opiumware.app"              mv -f "$TEMP/Opiumware.app" "$OPIUM_APP"
 run "codesign Opiumware.app"           codesign --force --deep --sign - "$OPIUM_APP"
-run "create ~/Opiumware directories"   bash -c 'mkdir -p ~/Opiumware/{workspace,autoexec,themes,modules} ~/Opiumware/modules/{decompiler,LuauLSP}'
-run "install Decompiler module"        mv -f "$TEMP/Resources/Decompiler" "$HOME/Opiumware/modules/decompiler/Decompiler"
-run "install LuauLSP module"           mv -f "$TEMP/Resources/LuauLSP" "$HOME/Opiumware/modules/LuauLSP/LuauLSP"
+run "create Opiumware directories"     mkdir -p "$OPIUM_HOME/workspace" "$OPIUM_HOME/autoexec" "$OPIUM_HOME/themes" "$OPIUM_HOME/modules/decompiler" "$OPIUM_HOME/modules/LuauLSP"
+run "install Decompiler module"        mv -f "$TEMP/Resources/Decompiler" "$OPIUM_HOME/modules/decompiler/Decompiler"
+run "install LuauLSP module"           mv -f "$TEMP/Resources/LuauLSP" "$OPIUM_HOME/modules/LuauLSP/LuauLSP"
+
+# if we ran under sudo, root now owns the files we created in the user's home —
+# hand them back so Opiumware (running as the user) can write its workspace
+if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    run "restore ownership of $OPIUM_HOME to $RUN_USER" chown -R "$RUN_USER" "$OPIUM_HOME"
+fi
 
 # ----------------------------------------------------------------------------
 # PHASE 6 — post-install verification
@@ -273,8 +320,8 @@ vcheck "dylib is x86_64"                 "lipo -archs '$DYLIB_DEST' | grep -q x8
 vcheck "libmimalloc loads the dylib"     "otool -L '$MIMALLOC' | grep -qi 'libOpiumware.dylib'"
 vcheck "Roblox.app codesign valid"       "codesign --verify --deep '$ROBLOX_APP'"
 vcheck "Opiumware.app codesign valid"    "codesign --verify --deep '$OPIUM_APP'"
-vcheck "Decompiler module installed"     "[ -f \"$HOME/Opiumware/modules/decompiler/Decompiler\" ]"
-vcheck "LuauLSP module installed"        "[ -f \"$HOME/Opiumware/modules/LuauLSP/LuauLSP\" ]"
+vcheck "Decompiler module installed"     "[ -f \"$OPIUM_HOME/modules/decompiler/Decompiler\" ]"
+vcheck "LuauLSP module installed"        "[ -f \"$OPIUM_HOME/modules/LuauLSP/LuauLSP\" ]"
 
 # ----------------------------------------------------------------------------
 # summary
