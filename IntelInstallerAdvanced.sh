@@ -13,6 +13,7 @@
 #  Usage:
 #    bash opiumware-install-intel-advanced.sh [--dry-run] [--force]
 #                                             [--no-launch] [--keep-temp]
+#  Made by alynoxiil and claude - with love
 # ============================================================================
 set -euo pipefail
 
